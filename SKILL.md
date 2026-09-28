@@ -19,6 +19,11 @@ description: Обработать запись стрима: YouTube-верси�
 
 ## 0. Где что лежит
 
+Запись стрима (шаг 0, до этого навыка) делает `recorder/`: CLI + пользовательский таймер
+systemd, которые через obs-websocket поднимают OBS и пишут эфир в `STREAMREC_OUTDIR`
+(по умолчанию `~/Videos/streams`); канал — только в `~/streamrec/.env` (`STREAMREC_CHANNEL`).
+Эта же папка указывается в `stream_root`. Подробности — `recorder/README.md`.
+
 Все пути берутся из `config.json` (см. `config.example.json`; `config.py` читает `config.json`
 в корне репозитория или файл из переменной окружения `STS_CONFIG`). Абсолютных путей в этом
 документе нет — только ключи конфига и раскладка репозитория.

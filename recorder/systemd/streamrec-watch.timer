@@ -1,0 +1,11 @@
+[Unit]
+Description=Таймер проверки эфира Twitch (каждые 60 с)
+
+[Timer]
+OnBootSec=60
+OnUnitActiveSec=60
+AccuracySec=5s
+Unit=streamrec-watch.service
+
+[Install]
+WantedBy=timers.target

@@ -22,6 +22,21 @@ Two outputs from one recording:
 2. **Vertical clips** — several 1080×1920, 60 fps clips with burned-in captions, punch-in zooms
    and normalized loudness, ready for TikTok / YouTube Shorts.
 
+## Step 0: auto-recording (recorder/)
+
+`recorder/` is the step before this pipeline: a small CLI plus a systemd user timer that watches
+a Twitch channel and records the broadcast with OBS Studio over obs-websocket (Hybrid MP4,
+NVENC, 1920×1080 60 fps). It starts recording when the channel goes live, stops it after the
+stream ends, and never touches a recording started manually.
+
+The only thing you configure is `~/streamrec/.env` (`STREAMREC_CHANNEL`, obs-websocket password,
+`STREAMREC_OUTDIR`); no channel is hard-coded. Install with `recorder/install.sh`, point
+`stream_root` at `STREAMREC_OUTDIR`, and the recordings become sources for
+`scripts/sources.py`.
+
+See **[recorder/README.md](recorder/README.md)** for requirements, step-by-step install,
+commands and troubleshooting.
+
 ## Requirements
 
 - **Python 3.10**
@@ -333,6 +348,13 @@ Rendering commands: `scripts/clips/render_tt.py` (main engine, EDL → vertical 
 
 Лицензия — **AGPL-3.0**. Часть кода цензуры и транскрипции адаптирована из
 Reelsi (https://github.com/mxmlab/reelsi), AGPL-3.0.
+
+**Шаг 0 — автозапись.** Саму запись стрима делает `recorder/`: CLI + пользовательский таймер
+systemd, которые через obs-websocket поднимают OBS, начинают запись, когда канал выходит
+в эфир, и останавливают её после конца эфира. Канал задаётся только в `~/streamrec/.env`
+(`STREAMREC_CHANNEL`), папка записей — `STREAMREC_OUTDIR` (по умолчанию `~/Videos/streams`,
+её же надо указать в `stream_root`). Установка — `recorder/install.sh`, подробности —
+в [recorder/README.md](recorder/README.md).
 
 ## License
 

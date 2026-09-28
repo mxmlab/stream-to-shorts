@@ -1,0 +1,3 @@
+# streamrec — Python packages for ~/streamrec/venv.
+# The CLI itself uses only the standard library; the WebSocket client does not.
+obsws-python>=1.6,<2

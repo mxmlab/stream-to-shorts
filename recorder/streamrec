@@ -1,0 +1,632 @@
+#!/usr/bin/env python3
+"""streamrec — запись Twitch-эфира через OBS Studio (obs-websocket).
+
+Команды:
+    streamrec start    начать запись (при необходимости запустить OBS и дождаться websocket)
+    streamrec stop     остановить запись и напечатать путь файла
+    streamrec status   идёт ли запись, сколько длится, в эфире ли канал
+    streamrec watch    одна проверка для таймера: авто-старт/авто-стоп
+    streamrec launch   поднять OBS и дождаться websocket, запись не начинать
+
+Канал берётся ТОЛЬКО из переменной окружения STREAMREC_CHANNEL (или из строки
+STREAMREC_CHANNEL=... в ~/streamrec/.env; ключ окружения приоритетнее). Если
+переменная пуста — команда завершается понятной ошибкой, зашитого канала нет.
+Канал подставляется в url источников «Browser» (плеер) и «Browser 2» (чат).
+
+Папка записей берётся из STREAMREC_OUTDIR (по умолчанию ~/Videos/streams).
+Пароль obs-websocket — из OBS_WS_PASSWORD (или OBS_WEBSOCKET_PASSWORD) в .env.
+"""
+
+import datetime as dt
+import json
+import logging
+import os
+import re
+import subprocess
+import sys
+import time
+import urllib.request
+from pathlib import Path
+
+# obsws-python логирует неудачные подключения через logger.exception и без
+# настроенного логгера печатает traceback в stderr — глушим, пишем сами в свой лог.
+logging.getLogger("obsws_python").addHandler(logging.NullHandler())
+logging.getLogger("obsws_python").propagate = False
+logging.getLogger("obsws_python").setLevel(logging.CRITICAL)
+
+HOME = Path.home()
+BASE = HOME / "streamrec"
+ENV_FILE = BASE / ".env"
+STATE_FILE = BASE / "state.json"
+LOG_FILE = BASE / "streamrec.log"
+
+OBS_APP_ID = "com.obsproject.Studio"
+OBS_PROC = "obs"                    # имя процесса Flatpak-сборки (pgrep -x obs)
+DEFAULT_OBS_HOST = "127.0.0.1"
+DEFAULT_OBS_PORT = 4455
+OBS_SENTINEL_DIR = HOME / ".var/app/com.obsproject.Studio/config/obs-studio/.sentinel"
+DEFAULT_OUTDIR = "~/Videos/streams"  # можно переопределить через STREAMREC_OUTDIR
+
+PLAYER_INPUT = "Browser"
+CHAT_INPUT = "Browser 2"
+PLAYER_URL = "https://player.twitch.tv/?channel={ch}&parent=streamlink&quality=chunked"
+CHAT_URL = "https://www.twitch.tv/popout/{ch}/chat?popout="
+
+GQL_URL = "https://gql.twitch.tv/gql"
+GQL_CLIENT_ID = "kimne78kx3ncx6brgo4mv6wki5h1ko"
+GQL_TIMEOUT = 10
+
+OFFLINE_LIMIT = 3      # сколько проверок подряд оффлайн -> авто-стоп
+OBS_WAIT = 60          # сколько секунд ждать websocket после запуска OBS
+OBS_KILL_WAIT = 10     # сколько секунд ждать завершения OBS после pkill -TERM
+RECORD_FRESH = 30      # свежесть файла записи: моложе — считаем, что запись идёт
+URL_SETTLE = 5         # пауза после смены url, чтобы плеер успел загрузиться
+STOP_WAIT = 30         # сколько секунд ждать, пока OBS подтвердит остановку записи
+STOP_POLL = 0.25       # период опроса статуса записи после stop_record
+LOGIN_RE = re.compile(r"^[A-Za-z0-9_]{1,25}$")
+
+DEFAULT_STATE = {
+    "recording": False,
+    "started_by": None,
+    "started_at": None,
+    "channel": None,
+    "offline_count": 0,
+    "last_check": None,
+    "last_result": None,
+    "output_path": None,
+}
+
+
+# ---------------------------------------------------------------- служебное
+
+def log(msg):
+    stamp = dt.datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S%z")
+    line = "%s %s" % (stamp, msg)
+    try:
+        with LOG_FILE.open("a", encoding="utf-8") as fh:
+            fh.write(line + "\n")
+    except OSError:
+        pass
+    return line
+
+
+def read_env():
+    env = {}
+    try:
+        text = ENV_FILE.read_text(encoding="utf-8")
+    except OSError:
+        return env
+    for raw in text.splitlines():
+        raw = raw.strip()
+        if not raw or raw.startswith("#") or "=" not in raw:
+            continue
+        key, val = raw.split("=", 1)
+        env[key.strip()] = val.strip().strip('"').strip("'")
+    return env
+
+
+def get_channel():
+    """Канал из STREAMREC_CHANNEL (окружение, затем .env). Пусто — ошибка."""
+    ch = (os.environ.get("STREAMREC_CHANNEL") or "").strip()
+    if not ch:
+        ch = (read_env().get("STREAMREC_CHANNEL") or "").strip()
+    if not ch:
+        raise RuntimeError(
+            "канал не задан: укажите STREAMREC_CHANNEL в %s "
+            "(например STREAMREC_CHANNEL=your_twitch_login)" % ENV_FILE
+        )
+    ch = ch.lower().lstrip("@")
+    if not LOGIN_RE.match(ch):
+        raise ValueError("некорректное имя канала: %r" % ch)
+    return ch
+
+
+def outdir():
+    """Папка записей: STREAMREC_OUTDIR (окружение, затем .env), дефолт ~/Videos/streams."""
+    raw = (os.environ.get("STREAMREC_OUTDIR") or "").strip()
+    if not raw:
+        raw = (read_env().get("STREAMREC_OUTDIR") or "").strip()
+    if not raw:
+        raw = DEFAULT_OUTDIR
+    return Path(os.path.expandvars(os.path.expanduser(raw)))
+
+
+def obs_password():
+    """Пароль obs-websocket: OBS_WS_PASSWORD, затем OBS_WEBSOCKET_PASSWORD."""
+    env = read_env()
+    for key in ("OBS_WS_PASSWORD", "OBS_WEBSOCKET_PASSWORD"):
+        val = (os.environ.get(key) or "").strip() or (env.get(key) or "").strip()
+        if val:
+            return val
+    return ""
+
+
+def env_value(key, default=""):
+    """Значение из окружения, затем из .env, затем default."""
+    val = (os.environ.get(key) or "").strip() or (read_env().get(key) or "").strip()
+    return val or default
+
+
+def obs_endpoint():
+    """(host, port) obs-websocket; можно переопределить OBS_WS_HOST/OBS_WS_PORT."""
+    host = env_value("OBS_WS_HOST", DEFAULT_OBS_HOST)
+    raw_port = env_value("OBS_WS_PORT", str(DEFAULT_OBS_PORT))
+    try:
+        port = int(raw_port)
+    except ValueError:
+        log("obs: некорректный OBS_WS_PORT=%r, беру %d" % (raw_port, DEFAULT_OBS_PORT))
+        port = DEFAULT_OBS_PORT
+    return host, port
+
+
+def state_read():
+    st = dict(DEFAULT_STATE)
+    try:
+        loaded = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+        if isinstance(loaded, dict):
+            st.update(loaded)
+    except (OSError, ValueError):
+        pass
+    return st
+
+
+def state_write(st):
+    STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    tmp = STATE_FILE.with_name(STATE_FILE.name + ".tmp")
+    tmp.write_text(json.dumps(st, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    tmp.replace(STATE_FILE)
+
+
+def now_iso():
+    return dt.datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+# ------------------------------------------------------------------- twitch
+
+def channel_is_live(channel):
+    """True/False — в эфире или нет; None — не знаю (сеть/непонятный ответ)."""
+    body = json.dumps({"query": 'query{user(login:"%s"){stream{id}}}' % channel}).encode("utf-8")
+    req = urllib.request.Request(
+        GQL_URL, data=body,
+        headers={"Client-ID": GQL_CLIENT_ID, "Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=GQL_TIMEOUT) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+    except Exception as exc:                                    # noqa: BLE001
+        log("twitch: запрос не удался для %s: %s" % (channel, exc))
+        return None
+    try:
+        user = payload["data"]["user"]
+    except (KeyError, TypeError):
+        log("twitch: неожиданный ответ для %s: %s" % (channel, str(payload)[:200]))
+        return None
+    if user is None:            # такого канала нет -> считаем оффлайн
+        return False
+    return user.get("stream") is not None
+
+
+# ---------------------------------------------------------------------- OBS
+
+def try_connect(timeout=3.0):
+    """Вернуть ReqClient или None, если websocket недоступен."""
+    try:
+        import obsws_python as obs
+    except ImportError:
+        raise SystemExit("obsws-python не найден: запусти ~/streamrec/venv/bin/python")
+    host, port = obs_endpoint()
+    # ключи для ReqClient собираем словарём: значения — функции выше
+    options = {"host": host, "port": port, "timeout": timeout,
+               "password": obs_password()}
+    try:
+        return obs.ReqClient(**options)
+    except Exception:                                           # noqa: BLE001
+        return None
+
+
+def obs_running():
+    for pattern in (["pgrep", "-x", "obs"], ["pgrep", "-f", OBS_APP_ID]):
+        try:
+            if subprocess.run(pattern, stdout=subprocess.DEVNULL,
+                              stderr=subprocess.DEVNULL).returncode == 0:
+                return True
+        except OSError:
+            pass
+    return False
+
+
+def session_env():
+    """Окружение для запуска GUI-приложения в Wayland-сессии пользователя."""
+    env = os.environ.copy()
+    uid = os.getuid()
+    env.setdefault("XDG_RUNTIME_DIR", "/run/user/%d" % uid)
+    env.setdefault("DBUS_SESSION_BUS_ADDRESS", "unix:path=%s/bus" % env["XDG_RUNTIME_DIR"])
+    env.setdefault("WAYLAND_DISPLAY", "wayland-0")
+    env["QT_QPA_PLATFORM"] = "wayland"
+    env.pop("DISPLAY", None)        # в сессии нет Xauthority, X11 не поднять
+    return env
+
+
+def clear_stale_sentinel():
+    """Удалить метки run_* от прошлого запуска OBS.
+
+    Если в .sentinel остался файл run_* от некорректно завершившегося запуска,
+    OBS показывает диалог Safe Mode и висит на нём — websocket не поднимается,
+    --disable-shutdown-check это не подавляет. Чистим только при остановленном
+    OBS: у живого процесса метка своя, рабочая.
+    """
+    if obs_running():
+        return 0
+    removed = 0
+    for mark in sorted(OBS_SENTINEL_DIR.glob("run_*")):
+        try:
+            mark.unlink()
+            removed += 1
+        except OSError as exc:
+            log("obs: не удалось удалить метку sentinel %s: %s" % (mark.name, exc))
+    log("obs: удалил устаревшие метки sentinel: %d" % removed)
+    return removed
+
+
+def fresh_recording_file(limit=RECORD_FRESH):
+    """Самый свежий .mp4 в каталоге записей, если он менялся меньше limit секунд назад.
+
+    Нужен, чтобы не убивать OBS, пока в него, возможно, пишется запись.
+    None — свежих файлов нет (или каталога нет).
+    """
+    newest = None
+    newest_mtime = None
+    for path in outdir().glob("*.mp4"):
+        try:
+            mtime = path.stat().st_mtime
+        except OSError:
+            continue
+        if newest_mtime is None or mtime > newest_mtime:
+            newest, newest_mtime = path, mtime
+    if newest is None or time.time() - newest_mtime >= limit:
+        return None
+    return newest
+
+
+def wait_websocket(seconds):
+    """Ждать websocket до seconds секунд; вернуть клиент или None."""
+    started = time.monotonic()
+    while time.monotonic() - started < seconds:
+        time.sleep(2)
+        client = try_connect()
+        if client is not None:
+            log("obs: websocket доступен через %.0f с" % (time.monotonic() - started))
+            return client
+    return None
+
+
+def kill_obs():
+    """Погасить OBS: pkill -TERM, ждать до OBS_KILL_WAIT, при необходимости pkill -KILL.
+
+    Сначала бьём по шаблону с именем приложения (com.obsproject.Studio). У
+    Flatpak-сборки в командной строке зависшего процесса имени приложения нет
+    (процесс называется просто obs, а flatpak-обёртка к этому моменту уже
+    вышла), поэтому если по шаблону никто не нашёлся — добиваем по имени
+    процесса и через flatpak kill.
+
+    ВНИМАНИЕ: pkill -f com.obsproject.Studio по ssh может совпасть с командной
+    строкой самого ssh-сеанса и убить его. Здесь это безопасно (команды идут
+    отдельными процессами), но руками из ssh так делать нельзя — см. README.
+    """
+    for sig in ("-TERM", "-KILL"):
+        for cmd in (["pkill", sig, "-f", OBS_APP_ID],
+                    ["pkill", sig, "-x", OBS_PROC],
+                    ["flatpak", "kill", OBS_APP_ID]):
+            if not obs_running():
+                return True
+            log("obs: гашу процесс: %s" % " ".join(cmd))
+            try:
+                subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            except OSError as exc:                              # noqa: BLE001
+                log("obs: %s не удался: %s" % (" ".join(cmd), exc))
+        deadline = time.monotonic() + OBS_KILL_WAIT
+        while time.monotonic() < deadline:
+            if not obs_running():
+                return True
+            time.sleep(0.5)
+    alive = obs_running()
+    if alive:
+        log("obs: процесс не завершился даже после pkill -KILL")
+    return not alive
+
+
+def launch_obs():
+    clear_stale_sentinel()
+    cmd = ["flatpak", "run", OBS_APP_ID,
+           "--minimize-to-tray", "--disable-shutdown-check", "--disable-updater"]
+    log("obs: запускаю: %s" % " ".join(cmd))
+    subprocess.Popen(cmd, env=session_env(), stdin=subprocess.DEVNULL,
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                     start_new_session=True)
+
+
+def ensure_obs():
+    client = try_connect()
+    if client is not None:
+        return client
+    running = obs_running()
+    if running:
+        log("obs: процесс уже запущен, жду websocket")
+    else:
+        launch_obs()
+    client = wait_websocket(OBS_WAIT)
+    if client is not None:
+        return client
+    if not running:
+        raise RuntimeError("obs-websocket не ответил за %d с" % OBS_WAIT)
+
+    # Процесс есть, а websocket молчит — OBS завис (обычно на диалоге Safe Mode).
+    # Одна попытка перезапуска, и только если запись точно не идёт.
+    log("obs: процесс есть, websocket молчит %d с — перезапускаю" % OBS_WAIT)
+    fresh = fresh_recording_file()
+    if fresh is not None:
+        log("obs: файл %s менялся меньше %d с назад — запись может идти, OBS не трогаю"
+            % (fresh.name, RECORD_FRESH))
+        raise RuntimeError("obs-websocket не ответил за %d с, но запись может идти — "
+                           "OBS не перезапускаю" % OBS_WAIT)
+    kill_obs()
+    clear_stale_sentinel()
+    launch_obs()
+    client = wait_websocket(OBS_WAIT)
+    if client is not None:
+        return client
+    log("obs: после перезапуска websocket так и не ответил за %d с" % OBS_WAIT)
+    raise RuntimeError("obs-websocket не ответил за %d с" % OBS_WAIT)
+
+
+def apply_channel(client, channel):
+    """Подставить канал в url плеера и чата (возвращает True, если url изменились)."""
+    player_url = PLAYER_URL.format(ch=channel)
+    chat_url = CHAT_URL.format(ch=channel)
+    changed = False
+    for name, url in ((PLAYER_INPUT, player_url), (CHAT_INPUT, chat_url)):
+        try:
+            current = client.get_input_settings(name).input_settings.get("url")
+        except Exception:                                       # noqa: BLE001
+            current = None
+        if current != url:
+            changed = True
+    client.set_input_settings(PLAYER_INPUT, {"url": player_url}, True)
+    client.set_input_settings(CHAT_INPUT, {"url": chat_url}, True)
+    log("obs: url источников -> канал %s (изменились: %s)" % (channel, changed))
+    return changed
+
+
+def record_active(client):
+    try:
+        return bool(client.get_record_status().output_active)
+    except Exception:                                           # noqa: BLE001
+        return None
+
+
+# ------------------------------------------------------------------ команды
+
+def start_recording(channel, source):
+    client = ensure_obs()
+    state = state_read()
+    active = record_active(client)
+    if active:
+        log("start: запись уже идёт (%s) — не трогаю" % (state.get("started_by") or "?"))
+        print("Запись уже идёт (запущена: %s)" % (state.get("started_by") or "неизвестно"))
+        return 0
+    try:
+        changed = apply_channel(client, channel)
+    except Exception as exc:                                    # noqa: BLE001
+        log("start: не удалось переключить url источников: %s" % exc)
+        raise
+    if changed:
+        time.sleep(URL_SETTLE)
+    client.start_record()
+    state.update(recording=True, started_by=source, started_at=now_iso(),
+                 channel=channel, offline_count=0, last_result="live")
+    state_write(state)
+    log("start: запись начата, канал %s, источник %s" % (channel, source))
+    print("Запись начата: канал %s (%s)" % (channel, source))
+    return 0
+
+
+def clear_recording(state):
+    state.update(recording=False, started_by=None, started_at=None, offline_count=0)
+
+
+def stop_recording(reason):
+    state = state_read()
+    client = try_connect()
+    if client is None:
+        clear_recording(state)
+        state_write(state)
+        log("stop: OBS недоступен, записи нет")
+        print("OBS не запущен — запись не идёт")
+        return 0
+    if not record_active(client):
+        clear_recording(state)
+        state_write(state)
+        log("stop: запись и так не шла")
+        print("Запись не идёт")
+        return 0
+    resp = client.stop_record()
+    path = getattr(resp, "output_path", None)
+    # OBS дописывает файл ещё около секунды: ждём, пока output_active станет False.
+    started = time.monotonic()
+    stopped = False
+    while True:
+        if record_active(client) is False:
+            stopped = True
+            break
+        if time.monotonic() - started >= STOP_WAIT:
+            break
+        time.sleep(STOP_POLL)
+    waited = time.monotonic() - started
+    if not stopped:
+        log("stop (%s): OBS не подтвердил остановку за 30 с" % reason)
+        print("Остановка запрошена, OBS ещё завершает запись")
+        return 1
+    clear_recording(state)
+    state["output_path"] = path
+    state_write(state)
+    log("stop (%s): запись остановлена, файл %s (ждали %.1f с)" % (reason, path, waited))
+    print(path if path else "Запись остановлена, путь файла неизвестен")
+    return 0
+
+
+def launch_only():
+    """Поднять OBS (с чисткой sentinel) и дождаться websocket, запись не начинать."""
+    ensure_obs()
+    log("launch: OBS запущен, websocket доступен, запись не начинаю")
+    print("OBS запущен, websocket доступен")
+    return 0
+
+
+def human_duration(timecode):
+    if not timecode:
+        return "неизвестно"
+    return timecode.split(".")[0]
+
+
+def show_status():
+    channel = get_channel()
+    state = state_read()
+    client = try_connect(timeout=3)
+    recording = False
+    timecode = None
+    if client is not None:
+        try:
+            st = client.get_record_status()
+            recording = bool(st.output_active)
+            timecode = st.output_timecode
+        except Exception as exc:                                # noqa: BLE001
+            log("status: запрос к OBS не удался: %s" % exc)
+    else:
+        if state.get("recording"):
+            clear_recording(state)
+            state_write(state)
+            log("status: запись числилась идущей, но OBS её не подтверждает")
+
+    if recording:
+        print("Запись: идёт")
+        print("Длительность: %s" % human_duration(timecode))
+        print("Запущена: %s" % (state.get("started_by") or "неизвестно"))
+        if state.get("output_path"):
+            print("Последний файл: %s" % state["output_path"])
+    else:
+        print("Запись: не идёт")
+        if state.get("output_path"):
+            print("Последний файл: %s" % state["output_path"])
+
+    live = channel_is_live(channel)
+    if live is True:
+        print("Канал %s: в эфире" % channel)
+    elif live is False:
+        print("Канал %s: оффлайн" % channel)
+    else:
+        print("Канал %s: неизвестно (сеть)" % channel)
+    return 0
+
+
+def watch_once():
+    channel = get_channel()
+    state = state_read()
+    live = channel_is_live(channel)
+
+    if live is None:
+        state.update(last_check=now_iso(), last_result="unknown")
+        state_write(state)
+        log("watch: канал %s — сеть недоступна, состояние не меняю" % channel)
+        print("не знаю")
+        return 0
+
+    if live:
+        state["offline_count"] = 0
+        state["last_result"] = "live"
+        state["last_check"] = now_iso()
+        state_write(state)
+        client = try_connect()
+        active = record_active(client) if client is not None else False
+        if active:
+            log("watch: канал %s в эфире, запись уже идёт" % channel)
+            print("в эфире, запись идёт")
+        else:
+            if state.get("recording"):
+                log("watch: запись числилась идущей, но OBS её не подтверждает")
+            clear_recording(state)
+            state_write(state)
+            log("watch: канал %s в эфире, записи нет -> авто-старт" % channel)
+            print("в эфире, запускаю запись (auto)")
+            start_recording(channel, "auto")
+        return 0
+
+    # канал оффлайн
+    state["last_result"] = "offline"
+    state["last_check"] = now_iso()
+    client = try_connect()
+    active = record_active(client) if client is not None else False
+    if not active and state.get("recording"):
+        clear_recording(state)
+        state_write(state)
+        log("watch: канал %s оффлайн, запись уже не идёт" % channel)
+        print("оффлайн, запись не идёт")
+        return 0
+
+    if active:
+        if state.get("started_by") == "auto":
+            state["offline_count"] = int(state.get("offline_count") or 0) + 1
+            count = state["offline_count"]
+            state_write(state)
+            log("watch: канал %s оффлайн, проверка %d/%d" % (channel, count, OFFLINE_LIMIT))
+            if count >= OFFLINE_LIMIT:
+                log("watch: канал %s оффлайн %d проверки подряд -> авто-стоп" % (channel, count))
+                print("оффлайн %d/%d, останавливаю запись (auto)" % (count, OFFLINE_LIMIT))
+                stop_recording("auto")
+            else:
+                print("оффлайн %d/%d" % (count, OFFLINE_LIMIT))
+        else:
+            state["offline_count"] = 0
+            state_write(state)
+            log("watch: канал %s оффлайн, но запись запущена вручную — не останавливаю" % channel)
+            print("оффлайн, запись запущена вручную — не останавливаю")
+        return 0
+
+    state["offline_count"] = 0
+    state_write(state)
+    log("watch: канал %s оффлайн, запись не идёт" % channel)
+    print("оффлайн, запись не идёт")
+    return 0
+
+
+# -------------------------------------------------------------------- точка
+
+def main(argv):
+    if len(argv) < 2 or argv[1] in ("-h", "--help", "help"):
+        print(__doc__.strip())
+        return 0 if len(argv) > 1 else 2
+
+    command = argv[1]
+    source = "auto" if "--auto" in argv[2:] else "manual"
+
+    try:
+        if command == "start":
+            return start_recording(get_channel(), source)
+        if command == "stop":
+            return stop_recording("manual")
+        if command == "status":
+            return show_status()
+        if command == "launch":
+            return launch_only()
+        if command == "watch":
+            return watch_once()
+    except Exception as exc:                                    # noqa: BLE001
+        log("%s: ошибка: %s" % (command, exc))
+        print("Ошибка: %s" % exc, file=sys.stderr)
+        return 1
+
+    print("Неизвестная команда: %s" % command, file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

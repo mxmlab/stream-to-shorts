@@ -1,0 +1,10 @@
+[Unit]
+Description=Проверка эфира Twitch и авто-запись через OBS (streamrec watch)
+
+[Service]
+Type=oneshot
+# Канал берётся из ~/streamrec/.env (STREAMREC_CHANNEL), а не из этого файла:
+# так настройка живёт в одном месте. Окружение процесса, если нужно, можно
+# задать здесь или через drop-in:
+#   systemctl --user edit streamrec-watch.service
+ExecStart=%h/streamrec/streamrec watch

@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=OBS Studio (streamrec)
+Comment=Автозапуск OBS для автоматической записи стрима (канал из ~/streamrec/.env)
+# install.sh подставляет сюда абсолютный домашний путь вместо @HOME@
+Exec=@HOME@/streamrec/streamrec launch
+Terminal=false
+X-GNOME-Autostart-enabled=true
