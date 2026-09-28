@@ -1,0 +1,43 @@
+{
+  "name": "example_youtube",
+  "source": "D:/streams/example_game/example_game1.mp4",
+  "source_duration": 7200.0,
+  "intro": "D:/streams/example_game/youtube/disclaimer.mp4",
+  "intro_gain_db": -6.0,
+  "output": "D:/streams/example_game/youtube/example_game1_final.mp4",
+  "cuts_note": [
+    {
+      "a": 0.0,
+      "b": 120.0,
+      "why": "настройка OBS и вебки на экране — в версию не идёт"
+    },
+    {
+      "a": 3300.0,
+      "b": 3340.0,
+      "why": "личный рассказ — вырезано по просьбе"
+    },
+    {
+      "a": 7188.0,
+      "b": 7200.0,
+      "why": "хвост после «пока» (заставка offline)"
+    }
+  ],
+  "mutes_source_time": [
+    {
+      "a": 605.12,
+      "b": 605.27,
+      "word": "example",
+      "kind": "letter"
+    }
+  ],
+  "keep_segments_source_time": [
+    [
+      120.0,
+      3300.0
+    ],
+    [
+      3340.0,
+      7188.0
+    ]
+  ]
+}

@@ -1,0 +1,29 @@
+# медиа (в репозиторий входит только assets/)
+*.mp4
+*.mov
+*.mkv
+*.webm
+*.wav
+*.jpg
+*.jpeg
+*.png
+
+# ...кроме assets/
+!assets/
+!assets/**
+!assets/**/*.wav
+
+# питон
+__pycache__/
+*.pyc
+
+# локальные настройки и рабочие папки
+config.json
+_cache/
+out/
+*.log
+
+# словари мата (в репозиторий не входят)
+words*.json
+badwords.txt
+okwords.txt

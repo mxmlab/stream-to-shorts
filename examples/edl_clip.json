@@ -1,0 +1,40 @@
+{
+  "name": "example_clip",
+  "src": "example_game1",
+  "title": "Пример заголовка",
+  "layout": "example_cam_bottom_left",
+  "segments": [
+    {
+      "a": 1000.2,
+      "b": 1003.4
+    },
+    {
+      "a": 1004.1,
+      "b": 1008.9
+    },
+    {
+      "a": 1012.5,
+      "b": 1016.0
+    },
+    {
+      "a": 1020.3,
+      "b": 1024.8
+    }
+  ],
+  "punch": [
+    {
+      "t": 1013.1,
+      "dur": 0.7,
+      "scale": 1.15,
+      "focus": "cam",
+      "boom": true
+    }
+  ],
+  "cam_alt": true,
+  "caption_y": 1300,
+  "caption_off": [],
+  "extra_mute": [],
+  "game_view": {
+    "crop": [480, 270, 960, 540]
+  }
+}

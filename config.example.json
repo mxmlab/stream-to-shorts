@@ -1,0 +1,44 @@
+{
+  "stream_root": "D:/streams",
+  "analysis_dir": null,
+  "features_dir": null,
+  "clips_root": null,
+  "clips_vertical_root": null,
+  "out_dir": "out",
+  "temp_dir": "_cache/temp",
+
+  "badwords_path": "D:/wordlists/badwords.txt",
+  "okwords_path": "D:/wordlists/okwords.txt",
+
+  "ffmpeg": "C:/ffmpeg/bin/ffmpeg.exe",
+  "ffprobe": "C:/ffmpeg/bin/ffprobe.exe",
+
+  "separator_exe": "C:/tools/voice_engines/sep/Scripts/audio-separator.exe",
+  "separator_model_dir": "C:/tools/voice_engines/models",
+  "separator_model": "vocals_mel_band_roformer.ckpt",
+
+  "fonts_dir": "C:/Windows/Fonts",
+  "font_caption": "C:/Windows/Fonts/Montserrat-ExtraBold.ttf",
+  "font_title": "C:/Windows/Fonts/Montserrat-Black.ttf",
+  "font_intro": "C:/Windows/Fonts/Monocraft.ttf",
+  "font_intro_body": "C:/Windows/Fonts/Monocraft.ttf",
+
+  "censor": {
+    "window_frac": 0.40,
+    "min_window_sec": 0.15,
+    "word_pad_sec": 0.03
+  },
+
+  "layouts": {
+    "example_cam_bottom_left": {
+      "cam": [596, 335, 0, 745],
+      "game_x0": 560,
+      "note": "вебка внизу слева, 1920x1080 -> 1080x1920"
+    },
+    "example_cam_top_left": {
+      "cam": [456, 257, 0, 0],
+      "game_x0": 470,
+      "note": "вебка сверху слева (раскладка сменилась посреди стрима)"
+    }
+  }
+}
